@@ -128,6 +128,13 @@ static void pressureTick() {
   auto data = pressureReadDatapoint();
   stateDatasetFIFO.enqueue(data);
 
+#ifdef TELEPLOT_ENABLE
+  for (uint8_t i = 0; i < CONFIG_PRESSURE_COUNT; i++) {
+    TERMINAL_SERIAL.printf(">sensor_%d:%.8f:%d\n", i, data.measurements[i],
+                           data.localTime);
+  }
+#endif
+
   // disable status LED after tick
   digitalWrite(SENSORLED_PIN, PinStatus::LOW);
 }
@@ -232,6 +239,6 @@ void loop() {
 void loop1() {
   // TODO; determine if idle or recording from intercom command
   // TODO: set status LED state
-  BENCH("intercomTick", intercomFlushQueue());
+  // BENCH("intercomTick", intercomFlushQueue());
   delay(1000);
 }
