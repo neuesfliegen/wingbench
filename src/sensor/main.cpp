@@ -61,6 +61,8 @@ static AMS pressureSensors[PRESSURE_COUNT];
 static StatusLED led;
 
 // Data
+static bool stateSyncSet = false;
+static int32_t stateSyncOffset = 0;
 static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_PRESSURE_DATA>
     stateDatasetFIFO;
 
@@ -143,29 +145,26 @@ static void pressureTick() {
  * Intercom
  */
 
-static bool intercomInit() {
-  // TODO: wait for master to ask for time offset
-  // TODO: reply with local millis
+static void intercomSyncTime(int32_t offset) {
+  TERMINAL_SERIAL.printf("syncing time = %d\n", offset);
 
-  return true;
-}
+  stateSyncSet = true;
+  stateSyncOffset = offset;
 
-static void intercomSyncTime() {
-  // TODO
+  led.setStatus("operation/synced");
 }
 
 static bool intercomFlushQueue() {
-  if (stateDatasetFIFO.depth() == 0)
-    return false;
+  auto depth = stateDatasetFIFO.depth();
 
-  // determine how many datapoints to send
-  auto queueDepth = min(BUFSIZE_PRESSURE_DATA, stateDatasetFIFO.depth());
+  if (depth == 0)
+    return false;
 
   // allocate json document
   StaticJsonDocument<16 + (18 * PRESSURE_COUNT) * BUFSIZE_PRESSURE_DATA> doc;
   auto ds = doc.to<JsonArray>();
 
-  for (size_t i = 0; i < queueDepth; i++) {
+  for (size_t i = 0; i < depth; i++) {
     // fetch datapoint and save it to the json object
     intercom_result_datapoint_pressure_t p;
     auto deqResult = stateDatasetFIFO.dequeue(&p);
@@ -177,16 +176,63 @@ static bool intercomFlushQueue() {
     auto dp = ds.createNestedObject();
 
     // copy struct data
-    dp["ts"] = p.localTime;
+    dp["t"] = p.localTime;
     auto dpMeasurements = dp.createNestedArray("m");
     copyArray(p.measurements, dpMeasurements);
   }
 
   // stream serialized data to intercom
-  // TODO: switch to messagepack
-  serializeJson(ds, INTERCOM_SERIAL);
+  serializeMsgPack(ds, INTERCOM_SERIAL);
   INTERCOM_SERIAL.println();
   return true;
+}
+
+static void intercomHandleCommand(char* rawInput) {
+  auto rawCmd = String(rawInput);
+  rawCmd.trim();
+
+  auto cmdIndex = rawCmd.indexOf(' ', 0);
+  auto cmd = rawCmd.substring(0, cmdIndex > 0 ? cmdIndex : rawCmd.length());
+  auto param = rawCmd.substring(cmdIndex + 1, rawCmd.length());
+  cmd.trim();
+  param.trim();
+
+  auto command = cmd.c_str();
+
+  if (strcmp(command, "flush") == 0) {
+    intercomFlushQueue();
+  } else if (strcmp(command, "sync") == 0) {
+    intercomSyncTime(param.toInt());
+  } else {
+    TERMINAL_SERIAL.println("intercom: unknown command");
+  }
+}
+
+static void intercomTick() {
+  static char commandBuf[64];
+  static uint8_t commandBufIndex = 0;
+
+  while (INTERCOM_SERIAL.available()) {
+    char next;
+    INTERCOM_SERIAL.readBytes(&next, 1);
+
+    if (commandBufIndex == 63)
+      commandBufIndex = 0;
+
+    if (commandBufIndex > 0 && next == '\n') {
+      char cmd[64];
+      strncpy(cmd, commandBuf, commandBufIndex + 1);
+
+      intercomHandleCommand(cmd);
+
+      memset(commandBuf, 0, sizeof(commandBuf));
+      commandBufIndex = 0;
+      break;
+    } else {
+      commandBuf[commandBufIndex] = next;
+      commandBufIndex++;
+    }
+  }
 }
 
 /*
@@ -197,7 +243,7 @@ void setup() {
   // logging
   TERMINAL_SERIAL.begin(TERMINAL_SERIAL_SPEED);
 
-// intercom
+  // intercom
 #if INTERCOM_SERIAL != Serial
   INTERCOM_SERIAL.setRX(INTERCOM_SERIAL_PIN_RX);
   INTERCOM_SERIAL.setTX(INTERCOM_SERIAL_PIN_TX);
@@ -206,39 +252,37 @@ void setup() {
 
   // status LED
   led.begin(STATUSLED_PIN_R, STATUSLED_PIN_G, STATUSLED_PIN_B);
-  // yellow, constant
-  led.addStatus("init", STATUSLED_STATIC(255, 255, 0));
+  // blue, constant
+  led.addStatus("init", STATUSLED_STATIC(0, 0, 255));
   // red, 2 blinks
   led.addStatus("init/sensor_fail", STATUSLED_BLINK(255, 0, 0, 2));
-  // red, 3 blinks
-  led.addStatus("init/intercom_fail", STATUSLED_BLINK(255, 0, 0, 3));
-  // blue, 2 fast blinks
-  led.addStatus("operation/idle", STATUSLED_BLINK_FAST(0, 0, 255, 2));
+  // violet, 2 fast blinks
+  led.addStatus("operation/unsynced", STATUSLED_BLINK(255, 0, 255, 2));
   // green, 2 fast blinks
-  led.addStatus("operation/recording", STATUSLED_BLINK_FAST(0, 255, 0, 2));
+  led.addStatus("operation/synced", STATUSLED_BLINK_FAST(0, 255, 0, 2));
 
-  // wait for serial terminal to connect
+  // init status
   led.setStatus("init");
   led.tick();
-  delay(1000);
 
-  intercomInit();
+  // init pressure sensors
   pressureInit();
 
-  intercomSyncTime();
-
-  led.setStatus("operation/idle");
+  led.setStatus("operation/unsynced");
 }
 
 void loop() {
-  BENCH("pressureTick", pressureTick());
-  BENCH("statusLED", led.tick());
-  delay(1000 / CONFIG_PRESSURE_MEASUREMENT_HZ);
+  auto start = millis();
+
+  {
+    BENCH("pressureTick", pressureTick());
+    BENCH("statusLED", led.tick());
+  }
+
+  auto delta = millis() - start;
+  delay((1000 / CONFIG_PRESSURE_MEASUREMENT_HZ) - min(0, delta));
 }
 
 void loop1() {
-  // TODO; determine if idle or recording from intercom command
-  // TODO: set status LED state
-  // BENCH("intercomTick", intercomFlushQueue());
-  delay(1000);
+  intercomTick();
 }
