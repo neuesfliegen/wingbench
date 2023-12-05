@@ -146,19 +146,21 @@ static void pressureTick() {
  */
 
 static void intercomSyncTime(int32_t offset) {
-  TERMINAL_SERIAL.printf("syncing time = %d\n", offset);
-
-  stateSyncSet = true;
-  stateSyncOffset = offset;
-
-  led.setStatus("operation/synced");
+  if (offset == 0) {
+    TERMINAL_SERIAL.println("unsyncing time");
+    stateSyncSet = false;
+    stateSyncOffset = offset;
+    led.setStatus("operation/unsynced");
+  } else {
+    TERMINAL_SERIAL.printf("syncing time = %d\n", offset);
+    stateSyncSet = true;
+    stateSyncOffset = offset;
+    led.setStatus("operation/synced");
+  }
 }
 
 static bool intercomFlushQueue() {
   auto depth = stateDatasetFIFO.depth();
-
-  if (depth == 0)
-    return false;
 
   // allocate json document
   StaticJsonDocument<16 + (18 * PRESSURE_COUNT) * BUFSIZE_PRESSURE_DATA> doc;
@@ -178,12 +180,12 @@ static bool intercomFlushQueue() {
     // copy struct data
     dp["t"] = p.localTime;
     auto dpMeasurements = dp.createNestedArray("m");
-    copyArray(p.measurements, dpMeasurements);
+    copyArray(p.measurements, CONFIG_PRESSURE_COUNT, dpMeasurements);
   }
 
   // stream serialized data to intercom
-  serializeMsgPack(ds, INTERCOM_SERIAL);
-  INTERCOM_SERIAL.println();
+  serializeJson(ds, INTERCOM_SERIAL);
+  INTERCOM_SERIAL.print("\n");
   return true;
 }
 
@@ -202,35 +204,35 @@ static void intercomHandleCommand(char* rawInput) {
   if (strcmp(command, "flush") == 0) {
     intercomFlushQueue();
   } else if (strcmp(command, "sync") == 0) {
-    intercomSyncTime(param.toInt());
+    auto t = param.toInt();
+    intercomSyncTime(t);
+  } else if (strcmp(command, "unsync") == 0) {
+    intercomSyncTime(0);
   } else {
-    TERMINAL_SERIAL.println("intercom: unknown command");
+    TERMINAL_SERIAL.printf("intercom: unknown command: \"%s\"\n", command);
   }
 }
 
 static void intercomTick() {
-  static char commandBuf[64];
-  static uint8_t commandBufIndex = 0;
+  static TurboFIFO<char, 63> cmdBuf;
 
   while (INTERCOM_SERIAL.available()) {
     char next;
     INTERCOM_SERIAL.readBytes(&next, 1);
 
-    if (commandBufIndex == 63)
-      commandBufIndex = 0;
+    uint8_t d = cmdBuf.depth();
 
-    if (commandBufIndex > 0 && next == '\n') {
+    if (d > 0 && next == '\n') {
       char cmd[64];
-      strncpy(cmd, commandBuf, commandBufIndex + 1);
+      for (uint8_t i = 0; i < d; i++)
+        cmdBuf.dequeue(&cmd[i]);
+      cmd[d] = 0;
 
       intercomHandleCommand(cmd);
-
-      memset(commandBuf, 0, sizeof(commandBuf));
-      commandBufIndex = 0;
+      cmdBuf.clear();
       break;
     } else {
-      commandBuf[commandBufIndex] = next;
-      commandBufIndex++;
+      cmdBuf.enqueue(next);
     }
   }
 }
@@ -244,10 +246,7 @@ void setup() {
   TERMINAL_SERIAL.begin(TERMINAL_SERIAL_SPEED);
 
   // intercom
-#if INTERCOM_SERIAL != Serial
-  INTERCOM_SERIAL.setRX(INTERCOM_SERIAL_PIN_RX);
-  INTERCOM_SERIAL.setTX(INTERCOM_SERIAL_PIN_TX);
-#endif
+  INTERCOM_SERIAL.setPinout(INTERCOM_SERIAL_PIN_TX, INTERCOM_SERIAL_PIN_RX);
   INTERCOM_SERIAL.begin(INTERCOM_SERIAL_SPEED);
 
   // status LED
@@ -273,13 +272,12 @@ void setup() {
 
 void loop() {
   auto start = millis();
-
   {
     BENCH("pressureTick", pressureTick());
     BENCH("statusLED", led.tick());
   }
-
   auto delta = millis() - start;
+
   delay((1000 / CONFIG_PRESSURE_MEASUREMENT_HZ) - min(0, delta));
 }
 

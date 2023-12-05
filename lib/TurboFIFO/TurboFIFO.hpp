@@ -18,10 +18,6 @@ class TurboFIFO {
   bool enqueue(T value) {
     size_t nextIndex = (m_headIndex + 1) % S;
 
-    // if this index is the current tail, the ringbuffer is full
-    if (nextIndex == m_tailIndex)
-      return false;
-
     // set value and new head index
     m_ringBuf[m_headIndex] = value;
     m_headIndex = nextIndex;

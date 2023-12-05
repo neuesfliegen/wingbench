@@ -1,8 +1,10 @@
 #include <Arduino.h>
 #include <SdFat.h>
+#include <Wire.h>
 
 // dependencies
 #include <ArduinoJson.h>
+#include <OneButton.h>
 
 // libs
 #include <StatusLED.h>
@@ -21,28 +23,39 @@
 #define TERMINAL_SERIAL Serial
 #define TERMINAL_SERIAL_SPEED CONFIG_DEBUGLOG_BAUDRATE
 
+// I2C Busses
+#define I2C_BUS_1 (Wire)
+#define I2C_BUS_1_PIN_SDA (18u)
+#define I2C_BUS_1_PIN_SCL (19u)
+#define I2C_BUS_1_SPEED (100000u)
+
 // SD card logging
 #define SDLOG_PREALLOC_SIZE CONFIG_SDLOG_PREALLOCATE_BYTES
 
 // Serial intercom data transfer
 #define INTERCOM_SERIAL_SPEED CONFIG_INTERCOM_BAUDRATE
-#define INTERCOM_SENSOR1_SERIAL Serial1
+#define INTERCOM_SERIAL_READ_BUFFER_SIZE (1024 * 32)
+#define INTERCOM_SENSOR1_SERIAL Serial5
 #define INTERCOM_SENSOR2_SERIAL Serial2
-#define INTERCOM_SENSOR3_SERIAL Serial3
-#define INTERCOM_SENSOR4_SERIAL Serial4
-#define INTERCOM_SENSOR5_SERIAL Serial5
+#define INTERCOM_SENSOR3_SERIAL Serial4
+#define INTERCOM_SENSOR4_SERIAL Serial3
+#define INTERCOM_SENSOR5_SERIAL Serial6
+
+// Buttons
+#define BUTTON_A_PIN (30u)
+#define BUTTON_B_PIN (31u)
 
 // Status LED
-#define STATUSLED_PIN_R (6u)
-#define STATUSLED_PIN_G (8u)
-#define STATUSLED_PIN_B (7u)
+#define STATUSLED_PIN_R (36u)
+#define STATUSLED_PIN_G (33u)
+#define STATUSLED_PIN_B (37u)
 
 /*
  * Logical configuration
  */
 
 // Buffers
-#define BUFSIZE_SENSOR_DATA (512u)
+#define BUFSIZE_SENSOR_DATA (200)
 
 /*
  * Application state
@@ -50,90 +63,250 @@
 
 // Peripherals
 static StatusLED led;
-SdFs stateFs;
-FsFile stateLogfile;
+OneButton buttonA(BUTTON_A_PIN, true, true);
+OneButton buttonB(BUTTON_B_PIN, true, true);
+SdFs fs;
+FsFile logfile;
 
 // Data
-static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_SENSOR_DATA>
-    stateSensor1FIFO;
-static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_SENSOR_DATA>
-    stateSensor2FIFO;
-static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_SENSOR_DATA>
-    stateSensor3FIFO;
-static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_SENSOR_DATA>
-    stateSensor4FIFO;
-static TurboFIFO<intercom_result_datapoint_pressure_t, BUFSIZE_SENSOR_DATA>
-    stateSensor5FIFO;
+static HardwareSerial* intercomPorts[] = {
+    &INTERCOM_SENSOR1_SERIAL, &INTERCOM_SENSOR2_SERIAL,
+    &INTERCOM_SENSOR3_SERIAL, &INTERCOM_SENSOR4_SERIAL,
+    &INTERCOM_SENSOR5_SERIAL};
+static uint8_t intercomBuffers[sizeof(intercomPorts) / sizeof(intercomPorts[0])]
+                              [INTERCOM_SERIAL_READ_BUFFER_SIZE];
+static TurboFIFO<pressure_datapoint_t,
+                 BUFSIZE_SENSOR_DATA *
+                     (sizeof(intercomPorts) / sizeof(intercomPorts[0]))>
+    pressureDatapoints;
 
 /*
  * Logging / SD card operation
  */
 
 bool loggingInit() {
-  if (!stateFs.begin(SdioConfig(FIFO_SDIO))) {
-    stateFs.initErrorHalt(&TERMINAL_SERIAL);
-    Serial.println("a");
+  if (!fs.begin(SdioConfig(FIFO_SDIO))) {
+    fs.initErrorPrint(&TERMINAL_SERIAL);
     return false;
   }
-  if (!stateLogfile.open("log.csv", O_RDWR | O_CREAT | O_TRUNC)) {
-    Serial.println("b");
-    return false;
-  }
-  if (!stateLogfile.preAllocate(512)) {
-    Serial.println("c");
-    stateLogfile.close();
-    return false;
-  }
-
-  stateLogfile.write("Hello, World", 13);
-  stateLogfile.sync();
-  stateLogfile.close();
 
   return true;
+}
+
+bool loggingOpenFile() {
+  char filename[32];
+
+  for (int i = 0;; i++) {
+    snprintf(filename, sizeof(filename), "wingbench_%d.csv", i);
+
+    if (!fs.exists(filename)) {
+      logfile.open(filename, O_RDWR | O_CREAT | O_TRUNC);
+      break;
+    }
+  }
+
+  TERMINAL_SERIAL.printf("opened log file: %s\n", filename);
+
+  if (!logfile.preAllocate(CONFIG_SDLOG_PREALLOCATE_BYTES)) {
+    logfile.close();
+    return false;
+  }
+
+  logfile.write("timestamp,sensor_id,");
+  for (uint8_t i = 0; i < CONFIG_PRESSURE_COUNT - 1; i++) {
+    logfile.printf("p_%d,", i);
+  }
+  logfile.printf("p_%d\n", CONFIG_PRESSURE_COUNT - 1);
+
+  logfile.flush();
+
+  return true;
+}
+
+void loggingFlushBuffer() {
+  auto amount = pressureDatapoints.depth();
+  TERMINAL_SERIAL.printf("writing %d datapoints to log...\n", amount);
+
+  for (size_t i = 0; i < amount; i++) {
+    pressure_datapoint_t d;
+    if (!pressureDatapoints.dequeue(&d))
+      break;
+
+    logfile.printf("%d,%d,", d.data.localTime, d.port);
+
+    uint8_t s = sizeof(d.data.measurements) / sizeof(d.data.measurements[0]);
+    for (uint8_t j = 0; j < s - 1; j++)
+      logfile.printf("%f,", d.data.measurements[j]);
+    logfile.printf("%f\n", d.data.measurements[s - 1]);
+  }
+
+  logfile.flush();
+  TERMINAL_SERIAL.println("flushed to sd card");
+}
+
+/*
+ * Intercom operation
+ */
+
+void intercomSyncAll() {
+  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]); i++)
+    intercomPorts[i]->printf("sync %d\n", millis());
+}
+
+void intercomUnsyncAll() {
+  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]); i++)
+    intercomPorts[i]->printf("unsync");
+}
+
+void intercomFlushAndBuffer(HardwareSerial* intercom, uint8_t port) {
+  // send flush command
+  intercom->println("flush");
+
+  // wait for sensor to start  transmitting data
+  auto timeoutStart = millis();
+  while (!intercom->available())
+    if (millis() - timeoutStart > 100)
+      return;
+
+  // now deserialize all incoming data
+  StaticJsonDocument<1024 * 64> doc;
+  deserializeJson(doc, *intercom);
+
+  // parse data into datapoints and save them to the global FIFO queue
+  for (size_t i = 0; i < doc.size(); i++) {
+    JsonObject dp = doc[i];
+    JsonArray dm = dp["m"].as<JsonArray>();
+
+    pressure_datapoint_t p = {.port = port, .data = {.localTime = dp["t"]}};
+    for (uint8_t j = 0; j < dm.size(); j++)
+      p.data.measurements[j] = dm[j];
+
+    pressureDatapoints.enqueue(p);
+  }
+}
+
+/*
+ * Buttons
+ */
+
+void buttonInit() {
+  attachInterrupt(
+      digitalPinToInterrupt(BUTTON_A_PIN),
+      []() {
+        buttonA.tick();
+        Serial.printf("button a = %s\n", digitalRead(BUTTON_A_PIN) ? "1" : "0");
+      },
+      CHANGE);
+  attachInterrupt(
+      digitalPinToInterrupt(BUTTON_B_PIN),
+      []() {
+        buttonB.tick();
+        Serial.printf("button b = %s\n", digitalRead(BUTTON_B_PIN) ? "1" : "0");
+      },
+      CHANGE);
+
+  buttonA.attachClick([]() { intercomSyncAll(); });
+}
+
+/*
+ * Helper functions
+ */
+
+void mirrorSerial(HardwareSerial* s) {
+  if (TERMINAL_SERIAL.available()) {
+    char c = TERMINAL_SERIAL.read();
+    s->write(c);
+  }
+  if (s->available()) {
+    char c = s->read();
+    TERMINAL_SERIAL.write(c);
+  }
 }
 
 /*
  * Arduino lifecycle functions
  */
 
+char bufA[8192];
+
 void setup() {
   // logging
   TERMINAL_SERIAL.begin(TERMINAL_SERIAL_SPEED);
+
+  // intercom
+  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]);
+       i++) {
+    intercomPorts[i]->addMemoryForRead(intercomBuffers[i],
+                                       INTERCOM_SERIAL_READ_BUFFER_SIZE);
+    intercomPorts[i]->begin(INTERCOM_SERIAL_SPEED);
+  }
+
+  // I2C bus
+  I2C_BUS_1.setSDA(I2C_BUS_1_PIN_SDA);
+  I2C_BUS_1.setSCL(I2C_BUS_1_PIN_SCL);
+  I2C_BUS_1.setClock(I2C_BUS_1_SPEED);
+  I2C_BUS_1.begin();
 
   // status LED
   led.begin(STATUSLED_PIN_R, STATUSLED_PIN_G, STATUSLED_PIN_B);
   // yellow, constant
   led.addStatus("init", STATUSLED_STATIC(255, 255, 0));
-  // red, 3 blinks
-  led.addStatus("init/intercom_fail", STATUSLED_BLINK(255, 0, 0, 3));
-  // orange, 4 blinks
-  led.addStatus("init/sdcard_fail", STATUSLED_BLINK(255, 127, 0, 2));
-  // blue, 2 fast blinks
-  led.addStatus("operation/idle", STATUSLED_BLINK_FAST(0, 0, 255, 2));
+  // red, constant
+  led.addStatus("init/sdcard_fail", STATUSLED_STATIC(255, 0, 0));
   // green, 2 fast blinks
-  led.addStatus("operation/recording", STATUSLED_BLINK_FAST(0, 255, 0, 2));
-  // green, fast blinking
-  led.addStatus("operation/recording", (statusled_pattern_t){
-                                           .onTime = 100,
-                                           .offTime = 100,
-                                           .blinks = 1,
-                                           .pauseTime = 0,
-                                           .colorR = 0,
-                                           .colorG = 255,
-                                           .colorB = 0,
-                                       });
+  led.addStatus("operation/idle", STATUSLED_BLINK_FAST(0, 100, 0, 2));
+  // blue, 2 fast blinks
+  led.addStatus("operation/recording", STATUSLED_BLINK_FAST(0, 0, 255, 2));
 
-  // wait for serial terminal to connect
+  TERMINAL_SERIAL.println("init...");
+
   led.setStatus("init");
   led.tick();
+
+  // wait for serial terminal to connect
   delay(1000);
 
+  TERMINAL_SERIAL.println("logging init...");
+
   if (!loggingInit()) {
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, 1);
+    led.setStatus("init/sdcard_fail");
+    for (;;) {
+      led.tick();
+      delay(50);
+    }
   }
+
+  TERMINAL_SERIAL.println("done");
+
+  buttonInit();
+
+  intercomUnsyncAll();
+  intercomSyncAll();
+
+  loggingOpenFile();
 
   led.setStatus("operation/idle");
 }
 
-void loop() {}
+void loop() {
+  // update StatusLED
+  led.tick();
+
+  // loop state
+  static uint8_t currentIntercomPort = 0;
+
+  // retrieve data
+  intercomFlushAndBuffer(intercomPorts[currentIntercomPort],
+                         currentIntercomPort + 1);
+
+  // next intercom port
+  currentIntercomPort = (currentIntercomPort + 1) %
+                        (sizeof(intercomPorts) / sizeof(intercomPorts[0]));
+
+  // save data if buffer is almost full
+  if (pressureDatapoints.depth() >
+      BUFSIZE_SENSOR_DATA *
+          (sizeof(intercomPorts) / (sizeof(intercomPorts[0])) - 1)) {
+    loggingFlushBuffer();
+  }
+}
