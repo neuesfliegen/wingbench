@@ -23,12 +23,6 @@
 #define TERMINAL_SERIAL Serial
 #define TERMINAL_SERIAL_SPEED CONFIG_DEBUGLOG_BAUDRATE
 
-// I2C Busses
-#define I2C_BUS_1 (Wire)
-#define I2C_BUS_1_PIN_SDA (18u)
-#define I2C_BUS_1_PIN_SCL (19u)
-#define I2C_BUS_1_SPEED (100000u)
-
 // SD card logging
 #define SDLOG_PREALLOC_SIZE CONFIG_SDLOG_PREALLOCATE_BYTES
 
@@ -190,6 +184,10 @@ void intercomFlushAndBuffer(HardwareSerial* intercom, uint8_t port) {
  */
 
 void buttonInit() {
+  // TODO: interrupts work correctly. OneButton does not, while following their
+  // recommended way to implement the tick function.
+  // Currently, two clicks trigger a click event at the end (most of the time).
+
   attachInterrupt(
       digitalPinToInterrupt(BUTTON_A_PIN),
       []() {
@@ -205,11 +203,16 @@ void buttonInit() {
       },
       CHANGE);
 
+  // Button A syncs all sensors
   buttonA.attachClick([]() { intercomSyncAll(); });
+  buttonb.attachClick([]() {
+    // TODO: implement recording start/stop with a state machine and
+    // loggingOpenFile() as well as a future loggingCloseFile()
+  });
 }
 
 /*
- * Helper functions
+ * Helper / Debug functions
  */
 
 void mirrorSerial(HardwareSerial* s) {
@@ -227,8 +230,6 @@ void mirrorSerial(HardwareSerial* s) {
  * Arduino lifecycle functions
  */
 
-char bufA[8192];
-
 void setup() {
   // logging
   TERMINAL_SERIAL.begin(TERMINAL_SERIAL_SPEED);
@@ -240,12 +241,6 @@ void setup() {
                                        INTERCOM_SERIAL_READ_BUFFER_SIZE);
     intercomPorts[i]->begin(INTERCOM_SERIAL_SPEED);
   }
-
-  // I2C bus
-  I2C_BUS_1.setSDA(I2C_BUS_1_PIN_SDA);
-  I2C_BUS_1.setSCL(I2C_BUS_1_PIN_SCL);
-  I2C_BUS_1.setClock(I2C_BUS_1_SPEED);
-  I2C_BUS_1.begin();
 
   // status LED
   led.begin(STATUSLED_PIN_R, STATUSLED_PIN_G, STATUSLED_PIN_B);
