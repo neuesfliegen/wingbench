@@ -277,9 +277,11 @@ void setup() {
   intercomUnsyncAll();
   intercomSyncAll();
 
+  led.setStatus("operation/idle");
+
   loggingOpenFile();
 
-  led.setStatus("operation/idle");
+  led.setStatus("operation/recording");
 }
 
 void loop() {
