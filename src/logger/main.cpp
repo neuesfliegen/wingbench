@@ -14,6 +14,7 @@
 #include "shared/bench.h"
 #include "shared/config.h"
 #include "shared/intercom.h"
+#include "shared/utils.h"
 
 /*
  * Hardware / IO Configuration
@@ -67,11 +68,10 @@ static HardwareSerial* intercomPorts[] = {
     &INTERCOM_SENSOR1_SERIAL, &INTERCOM_SENSOR2_SERIAL,
     &INTERCOM_SENSOR3_SERIAL, &INTERCOM_SENSOR4_SERIAL,
     &INTERCOM_SENSOR5_SERIAL};
-static uint8_t intercomBuffers[sizeof(intercomPorts) / sizeof(intercomPorts[0])]
+static uint8_t intercomBuffers[ARRAYSIZE(intercomPorts)]
                               [INTERCOM_SERIAL_READ_BUFFER_SIZE];
 static TurboFIFO<pressure_datapoint_t,
-                 BUFSIZE_SENSOR_DATA *
-                     (sizeof(intercomPorts) / sizeof(intercomPorts[0]))>
+                 BUFSIZE_SENSOR_DATA * ARRAYSIZE(intercomPorts)>
     pressureDatapoints;
 
 /*
@@ -128,7 +128,7 @@ void loggingFlushBuffer() {
 
     logfile.printf("%d,%d,", d.data.localTime, d.port);
 
-    uint8_t s = sizeof(d.data.measurements) / sizeof(d.data.measurements[0]);
+    uint8_t s = ARRAYSIZE(d.data.measurements);
     for (uint8_t j = 0; j < s - 1; j++)
       logfile.printf("%f,", d.data.measurements[j]);
     logfile.printf("%f\n", d.data.measurements[s - 1]);
@@ -143,12 +143,12 @@ void loggingFlushBuffer() {
  */
 
 void intercomSyncAll() {
-  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]); i++)
+  for (uint8_t i = 0; i < ARRAYSIZE(intercomPorts); i++)
     intercomPorts[i]->printf("sync %d\n", millis());
 }
 
 void intercomUnsyncAll() {
-  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]); i++)
+  for (uint8_t i = 0; i < ARRAYSIZE(intercomPorts); i++)
     intercomPorts[i]->printf("unsync");
 }
 
@@ -235,8 +235,7 @@ void setup() {
   TERMINAL_SERIAL.begin(TERMINAL_SERIAL_SPEED);
 
   // intercom
-  for (uint8_t i = 0; i < sizeof(intercomPorts) / sizeof(intercomPorts[0]);
-       i++) {
+  for (uint8_t i = 0; i < ARRAYSIZE(intercomPorts); i++) {
     intercomPorts[i]->addMemoryForRead(intercomBuffers[i],
                                        INTERCOM_SERIAL_READ_BUFFER_SIZE);
     intercomPorts[i]->begin(INTERCOM_SERIAL_SPEED);
@@ -295,13 +294,10 @@ void loop() {
                          currentIntercomPort + 1);
 
   // next intercom port
-  currentIntercomPort = (currentIntercomPort + 1) %
-                        (sizeof(intercomPorts) / sizeof(intercomPorts[0]));
+  currentIntercomPort = (currentIntercomPort + 1) % ARRAYSIZE(intercomPorts);
 
   // save data if buffer is almost full
   if (pressureDatapoints.depth() >
-      BUFSIZE_SENSOR_DATA *
-          (sizeof(intercomPorts) / (sizeof(intercomPorts[0])) - 1)) {
+      BUFSIZE_SENSOR_DATA * (ARRAYSIZE(intercomPorts) - 1))
     loggingFlushBuffer();
-  }
 }
